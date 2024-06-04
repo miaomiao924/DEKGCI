@@ -4,11 +4,11 @@ import torch.nn.functional as F
 from tqdm import tqdm #产生进度条
 import dataloader4kg
 from sklearn.metrics import roc_auc_score,precision_score,recall_score,accuracy_score
-
+from NGCF.utility.aggregator import Aggregator
 class KGCN( nn.Module ):
 
     def __init__( self, n_users, n_entitys, n_relations,
-                  adj_entity, adj_relation, n_neighbors,  e_dim= 16,
+                  adj_entity, adj_relation, n_neighbors,  e_dim= 64,
                   aggregator_method = 'sum',
                   act_method = F.relu, drop_rate=0.5):
         super(KGCN, self).__init__()
@@ -18,10 +18,11 @@ class KGCN( nn.Module ):
         self.user_embedding = nn.Embedding( n_users, e_dim, max_norm = 1 )
         self.entity_embedding = nn.Embedding( n_entitys, e_dim, max_norm = 1)
         self.relation_embedding = nn.Embedding( n_relations, e_dim, max_norm = 1)
-
+        self.n_iter=1
+        self.batch_size=8
         self.adj_entity = adj_entity #节点的邻接列表
         self.adj_relation = adj_relation #关系的邻接列表
-
+        self.aggregator = Aggregator(self.batch_size, self.e_dim, self.aggregator_method)
         #线性层
         self.linear_layer = nn.Linear(
                 in_features = self.e_dim * 2 if self.aggregator_method == 'concat' else self.e_dim,
@@ -32,67 +33,66 @@ class KGCN( nn.Module ):
         self.drop_rate = drop_rate #drop out 的比率
 
     def forward(self, users, items, is_evaluate = False):
-        neighbor_entitys, neighbor_relations = self.get_neighbors( items )
+
+        batch_size = items.size(0)
+        if batch_size != self.batch_size:
+            self.batch_size = batch_size
+        # change to [batch_size, 1]
+        users = users.view((-1, 1))
+        items = items.view((-1, 1))
+
         user_embeddings = self.user_embedding(users.cuda())
         item_embeddings = self.entity_embedding(items.cuda())
-        #print('item',items.shape)
-        #print('item_embedding', item_embeddings.shape)
-        #得到v波浪线
-        neighbor_vectors = self.__get_neighbor_vectors( neighbor_entitys, neighbor_relations, user_embeddings )
-        #进行自身消息聚合
-        out_item_embeddings = self.aggregator( item_embeddings, neighbor_vectors,is_evaluate)
-        #激活函数进行点击预测
-        #print('out',out_item_embeddings.shape)
-        #out = torch.sigmoid( torch.sum( user_embeddings * out_item_embeddings, axis = -1 ) )
-        #输出
+        neighbor_entitys, neighbor_relations = self.get_neighbors(items)  # 得到不同距离的实体集和关系集合
+        out_item_embeddings = self._aggregate(user_embeddings, neighbor_entitys, neighbor_relations)
         return user_embeddings,out_item_embeddings
 
-    def get_neighbors( self, items ):#得到邻居的节点embedding,和关系embedding
-        #[[1,2,3,4,5],[2,1,3,4,5]...[]]#总共batchsize个n_neigbor的id
-        #print('item',items)
-        entity_ids = [ self.adj_entity[item] for item in items ]
-        relation_ids = [ self.adj_relation[item] for item in items ]
-        neighbor_entities = [ torch.unsqueeze(self.entity_embedding(torch.LongTensor(one_ids).cuda()),0) for one_ids in entity_ids]
-        neighbor_relations = [ torch.unsqueeze(self.relation_embedding(torch.LongTensor(one_ids).cuda()),0) for one_ids in relation_ids]
-        # [batch_size, n_neighbor, dim]
-        neighbor_entities = torch.cat( neighbor_entities, dim=0 )
-        neighbor_relations = torch.cat( neighbor_relations, dim=0 )
+    def get_neighbors(self, items):
+        entities = [items]
+        relations = []
 
-        return neighbor_entities, neighbor_relations
+        for h in range(self.n_iter):
+            #neighbor_entities = torch.LongTensor(self.adj_entity[entities[h]]).view((self.batch_size, -1))
+            neighbor_entities = torch.LongTensor(self.adj_entity[entities[h]])
+            #print('1',neighbor_entities.shape)
+            neighbor_entities=neighbor_entities.view(self.batch_size,-1)
+            #print('2', neighbor_entities.shape)
+            neighbor_relations = torch.LongTensor(self.adj_relation[entities[h]]).view((self.batch_size, -1))
+            #print('3', neighbor_relations.shape)
+            entities.append(neighbor_entities)
+            relations.append(neighbor_relations)
 
-    #得到v波浪线
-    def __get_neighbor_vectors(self, neighbor_entitys, neighbor_relations, user_embeddings):
-        # [batch_size, n_neighbor, dim]
-        user_embeddings = torch.cat([torch.unsqueeze(user_embeddings,1) for _ in range(self.n_neighbors)],dim=1)
-        # [batch_size, n_neighbor]
-        user_relation_scores = torch.sum(user_embeddings * neighbor_relations, axis=2)
-        # [batch_size, n_neighbor]
-        user_relation_scores_normalized = F.softmax(user_relation_scores, dim=-1)
-        # [batch_size, n_neighbor, 1]
-        user_relation_scores_normalized = torch.unsqueeze(user_relation_scores_normalized, 2)
-        # [batch_size, dim]
-        neighbor_vectors = torch.sum(user_relation_scores_normalized * neighbor_entitys, axis=1)
-        return neighbor_vectors
+        #print(entities)
 
-    #经过进一步的聚合与线性层得到v
-    def aggregator(self,item_embeddings, neighbor_vectors, is_evaluate):
-        # [batch_size, dim]
-        if self.aggregator_method == 'sum':
-            output = item_embeddings + neighbor_vectors
-            #print('agg', item_embeddings.shape)
-            #print('agg', neighbor_vectors.shape)
-        elif self.aggregator_method == 'concat':
-            # [batch_size, dim * 2]
-            output = torch.cat([item_embeddings, neighbor_vectors], axis=-1)
-            #print('agg', output.shape)
-        else:#neighbor
-            output = neighbor_vectors
-       # print('agg',output.shape)
-        if not is_evaluate:
-            output = F.dropout(output, self.drop_rate)
-        # [batch_size, dim]
-        output = self.linear_layer(output)
-        return self.act(output)  #输出item-embedding
+        return entities, relations
+   
+
+    def _aggregate(self, user_embeddings, entities, relations):
+
+        entity_vectors = [ torch.unsqueeze(self.entity_embedding(torch.LongTensor(one_ids).cuda()),0) for one_ids in entities]
+        relation_vectors = [ torch.unsqueeze(self.relation_embedding(torch.LongTensor(one_ids).cuda()),0) for one_ids in relations]
+
+        for i in range(self.n_iter):
+            if i == self.n_iter - 1:
+                act = torch.tanh
+            else:
+                act = torch.sigmoid
+
+            entity_vectors_next_iter = []
+            for hop in range(self.n_iter - i):
+                vector = self.aggregator(
+                    entity_vectors[hop],  #自己的向量表示
+                    entity_vectors[hop + 1].view((self.batch_size, -1, self.n_neighbors, self.e_dim)), #邻居实体向量表示
+                    relation_vectors[hop].view((self.batch_size, -1, self.n_neighbors, self.e_dim)), #邻居关系向量表示
+                    user_embeddings,  #user-embeddings
+                    act)
+                entity_vectors_next_iter.append(vector)
+            entity_vectors = entity_vectors_next_iter
+
+        return entity_vectors[0].view((self.batch_size, self.e_dim))
+
+
+
 
 
 
